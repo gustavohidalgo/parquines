@@ -1,0 +1,736 @@
+AWSTemplateFormatVersion: '2010-09-09' 
+Parameters:
+    celular:
+        Type: String
+Resources:
+    IotThing:
+        Type: AWS::IoT::Thing
+        Properties:
+            ThingName: sensorparquin
+
+    IotTopicRule:
+        Type: AWS::IoT::TopicRule 
+        DependsOn: IotThing
+        Properties: 
+            RuleName: rulesensorparquin
+            TopicRulePayload:
+              RuleDisabled: false 
+              Sql: Select * FROM 'topic/sensor'
+              Actions:
+              - DynamoDB:
+                   RoleArn: !GetAtt RoleIotTopicRule.Arn
+                   TableName: !Ref DynamoTableSensor
+                   HashKeyField: local
+                   HashKeyType: STRING
+                   HashKeyValue: ${local}
+                   RangeKeyField: idsensor
+                   RangeKeyType: STRING
+                   RangeKeyValue: ${idsensor}
+                   PayloadField: Payload
+
+    DynamoTableSensor:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            TableName: tablaparquines
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+            - AttributeName: local
+              AttributeType: S
+            - AttributeName: idsensor
+              AttributeType: S    
+            KeySchema:
+            - AttributeName: local
+              KeyType: HASH
+            - AttributeName: idsensor
+              KeyType: RANGE
+            SSESpecification:
+              SSEEnabled: true
+            StreamSpecification:
+              StreamViewType: NEW_AND_OLD_IMAGES
+    
+    BucketStream: 
+        Type: AWS::S3::Bucket
+        DeletionPolicy: Delete
+
+    LambdaEventSourceDynamo:  
+        Type: AWS::Lambda::EventSourceMapping
+        Properties: 
+            BatchSize: 100
+            Enabled: true
+            EventSourceArn: !GetAtt DynamoTableSensor.StreamArn
+            FunctionName: !GetAtt LambdaFunctionDynamo.Arn
+            StartingPosition: TRIM_HORIZON
+       
+    LambdaFunctionDynamo:
+        Type: AWS::Lambda::Function
+        Properties:
+            Code:
+                ZipFile: |
+                  var AWS = require("aws-sdk");
+                  var s3 = new AWS.S3();
+
+                  let BUCKET_STREAM = process.env.BUCKET_STREAM;
+
+                  exports.lambda_handler = (event, context, callback) => {
+
+                      event.Records.forEach((record) => {
+                          var stream =JSON.stringify(record, null, 2);
+                          console.log('Stream record: ', JSON.stringify(record, null, 2));
+
+                          if (record.eventName == 'INSERT') {
+                              var sensor = JSON.stringify(record.dynamodb.NewImage.idsensor.S);
+                              var local = JSON.stringify(record.dynamodb.NewImage.local.S);
+                              var fechahoramin = JSON.stringify(record.dynamodb.NewImage.Payload.M.fechahoramin.S);
+                              var estado = JSON.stringify(record.dynamodb.NewImage.Payload.M.estado.S);
+                              
+                              var destbucket = BUCKET_STREAM;
+                              var content = '{\n"local":' + local + ',\n"fechahoramin":' + fechahoramin + ',\n"idsensor":' + sensor + ',\n"estado":' + estado + '\n}';
+                              var params = {Bucket: destbucket, Key: local.replace(/\"/g, "") + "-" + fechahoramin.replace(/\"/g, "") + "-" + sensor.replace(/\"/g, "") + ".json" , Body: content};
+                              s3.upload(params,function(err, data) {
+                                  if (err)
+                                      console.log(err)
+                                  else
+                                      console.log("Successfully saved object to /" );
+                                  });
+                          }
+                  });
+                  callback(null, `Successfully processed ${event.Records.length} records.`);
+                  };   
+            FunctionName: LambdaFunctionDynamo
+            Handler: index.lambda_handler
+            Runtime: nodejs12.x
+            MemorySize: 512
+            Timeout: 600
+            Role: !GetAtt RoleLambda.Arn
+            Environment:
+                Variables:
+                    BUCKET_STREAM: !Ref BucketStream
+        
+    LambdaFunctionPost:
+        Type: AWS::Lambda::Function
+        Properties:
+          Code:
+             ZipFile: |
+                  import boto3
+                  import os
+                  from boto3.dynamodb.conditions import Key
+
+                  DYNAMO_TABLA_SENSOR = os.environ['DYNAMO_TABLA_SENSOR']
+
+                  class DynamoAccessor:
+                      def __init__(self, dynamo_table):
+                          dynamo_db = boto3.resource('dynamodb')
+                          self.table = dynamo_db.Table(dynamo_table)
+
+                      def get_data_from_dynamo(self, local):
+                          response = self.table.query(KeyConditionExpression=Key('local').eq(local))
+                          return response["Items"] if any(response["Items"]) else None
+
+                  def lambda_handler(event, context):
+                      dynamo_backend = DynamoAccessor(DYNAMO_TABLA_SENSOR)
+                      db_element = dynamo_backend.get_data_from_dynamo(event['local'])
+                      return db_element
+          FunctionName: LambdaFunctionPost
+          Handler: index.lambda_handler
+          Runtime: python3.7
+          MemorySize: 512
+          Timeout: 600
+          Role: !GetAtt RoleLambda.Arn
+          Environment:
+              Variables:
+                  DYNAMO_TABLA_SENSOR: !Ref DynamoTableSensor
+
+    RestApiAD:
+      Type: AWS::ApiGateway::RestApi
+      DependsOn: LambdaFunctionPost
+      Properties:
+        Name: api-parquin
+
+    ApiGatewayMethod:
+      Type: AWS::ApiGateway::Method
+      Properties:
+        HttpMethod: POST
+        ResourceId: !GetAtt RestApiAD.RootResourceId
+        RestApiId: !Ref RestApiAD
+        AuthorizationType: NONE
+        MethodResponses:
+            - StatusCode: 200
+              ResponseModels: { "application/json": "Empty" }
+        Integration:
+          Type: AWS
+          IntegrationHttpMethod: "POST"
+          Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunctionPost.Arn}/invocations"
+          IntegrationResponses:
+            - StatusCode: 200
+              ResponseTemplates: {"application/json": ""}
+        OperationName: !Sub ${AWS::AccountId}
+   
+    ApiGatewayStage:
+        Type: AWS::ApiGateway::Stage
+        Properties:
+          DeploymentId: !Ref ApiGatewayDeployment
+          Description: Lambda API Stage v0
+          RestApiId: !Ref RestApiAD
+          StageName: 'v0'
+
+    ApiGatewayDeployment:
+      Type: AWS::ApiGateway::Deployment
+      DependsOn: ApiGatewayMethod
+      Properties:
+        Description: Lambda API Deployment
+        RestApiId: !Ref RestApiAD
+
+    lambdaApiGatewayInvoke:
+      Type: "AWS::Lambda::Permission"
+      DependsOn: LambdaFunctionPost
+      Properties:
+        Action: "lambda:InvokeFunction"
+        FunctionName: !Ref "LambdaFunctionPost"
+        Principal: "apigateway.amazonaws.com"
+        SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiAD}/*/POST/"
+
+    BucketPagosQR: 
+        Type: AWS::S3::Bucket
+        DeletionPolicy: Delete
+
+    DynamoTablePrecios:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            TableName: tablahistoriaprecios
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+            - AttributeName: local
+              AttributeType: S
+            - AttributeName: fechahora
+              AttributeType: S    
+            KeySchema:
+            - AttributeName: local
+              KeyType: HASH
+            - AttributeName: fechahora
+              KeyType: RANGE
+            SSESpecification:
+              SSEEnabled: true
+            StreamSpecification:
+              StreamViewType: NEW_AND_OLD_IMAGES
+
+    LambdaFunctionQR:
+      Type: AWS::Lambda::Function
+      Properties:
+        Code:
+           ZipFile: |
+                import json
+                import base64
+                import boto3
+                import os
+                from datetime import datetime
+                from boto3.dynamodb.conditions import Key
+
+                BUCKET_NAME = os.environ['BUCKET_PAGOSQR']
+                DYNAMO_TABLA_PRECIOS = os.environ['DYNAMO_TABLA_PRECIOS']
+
+                class DynamoAccessor:
+                    def __init__(self, dynamo_table):
+                        dynamo_db = boto3.resource('dynamodb')
+                        self.table = dynamo_db.Table(dynamo_table)
+
+                    def get_data_from_dynamo(self, local,fechahora):
+                        response = self.table.query(KeyConditionExpression= Key('local').eq(local) & Key('fechahora').eq(fechahora))
+                        return (response["Items"][0])['Payload']['precio'] if any(response["Items"]) else 0
+
+                def lambda_handler(event, context):
+                    codigoQR_idusuario = base64.b64decode(event['idusuario'])
+                    codigoQR_local = base64.b64decode(event['local'])
+                    codigoQR_trafico = base64.b64decode(event['trafico'])
+                    dateTimeObj = datetime.now()
+                    FechaHoraMin = dateTimeObj.strftime("%Y%m%d%H%M")
+                    FechaHora = FechaHoraMin[0:10]
+                    trafico = 'entrada'
+                    
+                    dynamo_backend = DynamoAccessor(DYNAMO_TABLA_PRECIOS)
+                    db_element = dynamo_backend.get_data_from_dynamo(codigoQR_local.decode('utf-8'),FechaHora)
+                    
+                    precio = str(db_element)
+                    duracion = '0'
+                    monto= '0'
+                    file_content = '{\n"idusuario":"' + codigoQR_idusuario.decode('utf-8') + '",\n"local":"' + codigoQR_local.decode('utf-8') \
+                    + '",\n"fechahora":"' + FechaHoraMin + '",\n"trafico":"' + codigoQR_trafico.decode('utf-8') \
+                    + '",\n"precio":"' + precio + '",\n"duracion":"' + duracion + '",\n"monto":"' + monto + '"\n}'
+
+                    file_path = codigoQR_local.decode('utf-8') + '-' + codigoQR_idusuario.decode('utf-8') + '-'+ FechaHoraMin + '.json'
+                    s3 = boto3.client('s3')
+                    try:
+                        s3_response = s3.put_object(Bucket=BUCKET_NAME, Key=file_path, Body=file_content)
+                    except Exception as e:
+                        raise IOError(e)
+                    return {
+                        'statusCode': 200,
+                        'body': {
+                            'file_path': file_path
+                        }
+                    }
+        FunctionName: LambdaFunctionQR
+        Handler: index.lambda_handler
+        Runtime: python3.7
+        MemorySize: 512
+        Timeout: 600
+        Role: !GetAtt RoleLambda.Arn
+        Environment:
+            Variables:
+                DYNAMO_TABLA_PRECIOS: !Ref DynamoTablePrecios
+                BUCKET_PAGOSQR: !Ref BucketPagosQR
+
+    RestApiADQR:
+        Type: AWS::ApiGateway::RestApi
+        DependsOn: LambdaFunctionQR
+        Properties:
+          Name: apiqr
+
+    ApiGatewayMethodQR:
+        Type: AWS::ApiGateway::Method
+        Properties:
+          HttpMethod: POST
+          ResourceId: !GetAtt RestApiADQR.RootResourceId
+          RestApiId: !Ref RestApiADQR
+          AuthorizationType: NONE
+          MethodResponses:
+              - StatusCode: 200
+                ResponseModels: { "application/json": "Empty" }
+          Integration:
+            Type: AWS
+            IntegrationHttpMethod: "POST"
+            Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunctionQR.Arn}/invocations"
+            IntegrationResponses:
+              - StatusCode: 200
+                ResponseTemplates: {"application/json": ""}
+          OperationName: !Sub ${AWS::AccountId}
+   
+    ApiGatewayStageQR:
+        Type: AWS::ApiGateway::Stage
+        Properties:
+          DeploymentId: !Ref ApiGatewayDeploymentQR
+          Description: Lambda API Stage v0
+          RestApiId: !Ref RestApiADQR
+          StageName: 'v0'
+
+    ApiGatewayDeploymentQR:
+        Type: AWS::ApiGateway::Deployment
+        DependsOn: ApiGatewayMethodQR
+        Properties:
+          Description: Lambda API Deployment
+          RestApiId: !Ref RestApiADQR
+
+    lambdaApiGatewayInvokeQR:
+      Type: "AWS::Lambda::Permission"
+      DependsOn: LambdaFunctionQR
+      Properties:
+        Action: "lambda:InvokeFunction"
+        FunctionName: !Ref "LambdaFunctionQR"
+        Principal: "apigateway.amazonaws.com"
+        SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApiADQR}/*/POST/"
+
+    DynamoTablePreciosCliente:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            TableName: tablaprecioscliente
+            BillingMode: PAY_PER_REQUEST
+            AttributeDefinitions:
+            - AttributeName: local
+              AttributeType: S
+            - AttributeName: fechahora
+              AttributeType: S    
+            KeySchema:
+            - AttributeName: local
+              KeyType: HASH
+            - AttributeName: fechahora
+              KeyType: RANGE
+            SSESpecification:
+              SSEEnabled: true
+            StreamSpecification:
+              StreamViewType: NEW_AND_OLD_IMAGES
+
+    SageMakerNotebookInstance:
+      Type: "AWS::SageMaker::NotebookInstance"
+      DependsOn: DynamoTablePreciosCliente
+      Properties:
+        InstanceType: "ml.t2.medium"
+        DefaultCodeRepository: "https://github.com/gustavohidalgo/parquines"
+        RoleArn: !GetAtt RoleSageMaker.Arn
+
+    SNSTopicCliente:
+        Type: AWS::SNS::Topic
+        Properties:
+          Subscription:
+            - Endpoint: !Ref celular
+              Protocol: "sms"
+          TopicName: "SNSTopicCliente"
+
+    LambdaEventSourceDynamoPreciosCliente:  
+        Type: AWS::Lambda::EventSourceMapping
+        Properties: 
+            BatchSize: 100
+            Enabled: true
+            EventSourceArn: !GetAtt DynamoTablePreciosCliente.StreamArn
+            FunctionName: !GetAtt LambdaFunctionPreciosCliente.Arn
+            StartingPosition: TRIM_HORIZON
+
+    LambdaFunctionPreciosCliente:
+        Type: AWS::Lambda::Function
+        Properties:
+            Code:
+                ZipFile: |
+                    var AWS = require("aws-sdk");
+                    var sns = new AWS.SNS();
+
+                    let SNS_TOPIC_CLIENTE_ARN   = process.env.SNS_TOPIC_CLIENTE_ARN;
+
+                    exports.lambda_handler = (event, context, callback) => {
+
+                        event.Records.forEach((record) => {
+                            var stream =JSON.stringify(record, null, 2);
+                            console.log('Stream record: ', JSON.stringify(record, null, 2));
+
+                            if (record.eventName == 'INSERT') {
+                                var local = JSON.stringify(record.dynamodb.NewImage.local.S);
+                                var fechahora = JSON.stringify(record.dynamodb.NewImage.fechahora.S);
+                                var precio = JSON.stringify(record.dynamodb.NewImage.Payload.M.precio.S);
+                                var params = {
+                                    Message: 'Precios de su Local de Parquines - ' + local.replace(/\"/g, "") + ' Fecha Hora ' + fechahora.replace(/\"/g, "") + ' - S/.' + precio.replace(/\"/g, ""),
+                                    TopicArn: SNS_TOPIC_CLIENTE_ARN
+                                };
+                                sns.publish(params, function(err, data) {
+                                    if (err) {
+                                        console.error("Unable to send message. Error JSON:", JSON.stringify(err, null, 2));
+                                    } else {
+                                        console.log("Results from sending message: ", JSON.stringify(data, null, 2));
+                                    }
+                                });
+                            }
+                    });
+                    callback(null, `Successfully processed ${event.Records.length} records.`);
+                    };   
+            FunctionName: LambdaFunctionPreciosCliente
+            Handler: index.lambda_handler
+            Runtime: nodejs12.x
+            MemorySize: 512
+            Timeout: 600
+            Role: !GetAtt RoleLambda.Arn
+            Environment:
+                Variables:
+                    SNS_TOPIC_CLIENTE_ARN: !Ref SNSTopicCliente
+
+    GlueCrawler:
+        Type: AWS::Glue::Crawler
+        DependsOn: DynamoTablePreciosCliente
+        Properties:
+          Name: "GlueCrawler"
+          Role: !GetAtt RoleGlue.Arn
+          DatabaseName: "databaseglue"
+          Targets:
+            S3Targets:
+              - Path: !Ref BucketStream
+              - Path: !Ref BucketPagosQR
+
+    GlueJobPrecios:
+        Type: AWS::Glue::Job
+        DependsOn: GlueCrawler
+        Properties:
+          Command: 
+            Name: glueetl
+            PythonVersion: 3
+            ScriptLocation: 
+                 !Sub s3://${BucketStream}/etl_precios.py
+          ExecutionProperty:
+            MaxConcurrentRuns: 2
+          Name: GlueJobPrecios
+          Role: !GetAtt RoleGlue.Arn
+
+    GlueJobClientes:
+        Type: AWS::Glue::Job
+        DependsOn: GlueCrawler
+        Properties:
+          Command: 
+            Name: glueetl
+            PythonVersion: 3
+            ScriptLocation: 
+                 !Sub s3://${BucketStream}/etl_clientes.py
+          ExecutionProperty:
+            MaxConcurrentRuns: 2
+          Name: GlueJobClientes
+          Role: !GetAtt RoleGlue.Arn
+
+    RoleIotTopicRule:  
+        Type: AWS::IAM::Role
+        Properties: 
+            ManagedPolicyArns:
+                - !Ref PolicyDynamo
+            AssumeRolePolicyDocument: 
+                Version: '2012-10-17'
+                Statement: 
+                  -
+                    Effect: Allow
+                    Principal: 
+                        Service: 
+                        - iot.amazonaws.com
+                    Action: 
+                        - sts:AssumeRole
+
+    RoleLambda:
+        Type: AWS::IAM::Role
+        Properties:
+            ManagedPolicyArns:
+                - !Ref PolicyDynamo
+                - !Ref PolicyS3
+                - !Ref PolicySns
+                - !Ref PolicyLogs
+                - !Ref PolicyLambda
+                - !Ref PolicyEC2
+                - !Ref PolicyCW
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                        Service:
+                            - lambda.amazonaws.com
+                    Action:
+                        - sts:AssumeRole
+
+    RoleSageMaker: 
+      Type: "AWS::IAM::Role"
+      Properties: 
+        AssumeRolePolicyDocument: 
+          Version: "2012-10-17"
+          Statement: 
+            - 
+              Effect: "Allow"
+              Principal: 
+                Service: 
+                  - "sagemaker.amazonaws.com"
+              Action: 
+                - "sts:AssumeRole"
+        Path: "/"
+        Policies: 
+          - 
+            PolicyName: "root"
+            PolicyDocument: 
+              Version: "2012-10-17"
+              Statement: 
+                - 
+                  Effect: "Allow"
+                  Action: "*"
+                  Resource: "*"
+
+    RoleApiGateway:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: ''
+              Effect: 'Allow'
+              Principal:
+                Service:
+                  - 'apigateway.amazonaws.com'
+              Action:
+                - 'sts:AssumeRole'
+        Path: '/'
+        Policies:
+          - PolicyName: LambdaAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action: 'lambda:*'
+                  Resource: !GetAtt LambdaFunctionPost.Arn
+                      
+    RoleApiGatewayQR:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: ''
+              Effect: 'Allow'
+              Principal:
+                Service:
+                  - 'apigateway.amazonaws.com'
+              Action:
+                - 'sts:AssumeRole'
+        Path: '/'
+        Policies:
+          - PolicyName: LambdaAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action: 'lambda:*'
+                  Resource: !GetAtt LambdaFunctionQR.Arn
+
+    RoleGlue:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Effect: "Allow"
+              Principal:
+                Service:
+                  - "glue.amazonaws.com"
+              Action:
+                - "sts:AssumeRole"
+        Path: "/"
+        Policies:
+          -
+            PolicyName: "root"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                -
+                  Effect: "Allow"
+                  Action: "*"
+                  Resource: "*"
+
+
+    PolicyDynamo:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - dynamodb:PutItem
+                          - dynamodb:UpdateItem
+                          - dynamodb:GetItem
+                          - dynamodb:GetRecords
+                          - dynamodb:GetShardIterator
+                          - dynamodb:DescribeStream
+                          - dynamodb:ListStreams
+                          - dynamodb:*
+                      Resource:
+                          - "*"   
+
+    PolicyS3:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - s3:PutObject
+                          - s3:ListObjects
+                          - s3:ListBucket
+                          - s3:GetObject
+                          - s3:ListAllMyBuckets
+                          - s3:HeadBucket
+                          - s3:*
+                      Resource:
+                          - "*" 
+    PolicySns:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - sns:Publish
+                      Resource:
+                          - "*" 
+    PolicyLogs:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - logs:CreateLogGroup
+                          - logs:CreateLogStream
+                          - logs:PutLogEvents
+                      Resource:
+                          - "*" 
+    PolicyLambda:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - lambda:InvokeFunction
+                      Resource:
+                          - "*" 
+
+    PolicyEC2:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - ec2:DisassociateAddress
+                          - ec2:CreateDhcpOptions
+                          - ec2:ReplaceRouteTableAssociation
+                          - ec2:RunScheduledInstances
+                          - ec2:RequestSpotFleet
+                          - ec2:DisableVgwRoutePropagation
+                          - ec2:AssociateVpcCidrBlock
+                          - ec2:ReleaseHosts
+                          - ec2:ReplaceRoute
+                          - ec2:DisassociateVpcCidrBlock
+                          - ec2:DeleteNetworkInterfacePermission
+                          - ec2:DescribeNetworkInterfaces
+                          - ec2:StartInstances
+                          - ec2:DescribeNetworkInterfaceAttribute
+                          - ec2:CreateRoute
+                          - ec2:ReplaceNetworkAclEntry
+                          - ec2:CreateSecurityGroup
+                          - ec2:CreateNetworkAcl
+                          - ec2:DescribeNetworkInterfacePermissions
+                          - ec2:TerminateInstances
+                          - ec2:AcceptVpcEndpointConnections
+                          - ec2:DeleteNetworkInterface
+                          - ec2:CreateRouteTable
+                          - ec2:RunInstances
+                          - ec2:StopInstances
+                          - ec2:DisassociateRouteTable
+                          - ec2:DisassociateSubnetCidrBlock
+                          - ec2:ModifyHosts
+                          - ec2:ReplaceNetworkAclAssociation
+                          - ec2:CreateVolume
+                          - ec2:CreateNetworkInterface
+                          - ec2:DetachVpnGateway
+                          - ec2:CreateDefaultVpc
+                          - ec2:DisassociateIamInstanceProfile
+                          - ec2:CreateVpcEndpoint
+                          - ec2:DisableVpcClassicLink
+                          - ec2:CreateSubnet
+                      Resource:
+                          - "*"
+
+                          - "*"
+
+    PolicyCW:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                      Effect: Allow
+                      Action:
+                          - logs:*
+                          - cloudwatch:*
+                          - xray:*
+                      Resource:
+                          - "*"
